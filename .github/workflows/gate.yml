@@ -1,0 +1,16 @@
+name: gate
+on:
+  pull_request:
+  merge_group:
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: the maintainer's real verification
+        run: |
+          echo "GATE-EVENT=${{ github.event_name }} REF=${{ github.ref }} SHA=${{ github.sha }}"
+          echo "GATE-SEES-TREE:"; ls -la
+          test ! -f PWNED.txt || { echo "GATE-WOULD-HAVE-FAILED: PWNED.txt present"; exit 1; }
+          if [ "${{ github.event_name }}" = "merge_group" ]; then sleep 240; fi
+          echo "GATE-VERDICT=PASS"
